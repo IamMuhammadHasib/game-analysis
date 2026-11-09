@@ -17,6 +17,8 @@ interface MapProperties extends Record<string, unknown> {
   "ISO3166-1-Alpha-2"?: string;
   "ISO3166-1-Alpha-3"?: string;
   ISO_N3?: string;
+  ISO_N3_EH?: string;
+  UN_A3?: string;
 }
 
 export type CountryFeature = Feature<Geometry, MapProperties>;
@@ -224,7 +226,9 @@ export function getMapData(
 
     const iso2 = String(properties["ISO3166-1-Alpha-2"] ?? "").toUpperCase();
 
-    const rawNumeric = String(properties.ISO_N3 ?? "").trim();
+    const rawNumeric = String(
+      properties.ISO_N3_EH ?? properties.UN_A3 ?? properties.ISO_N3 ?? "",
+    ).trim();
     const numeric = /^\d+$/.test(rawNumeric) ? String(Number(rawNumeric)) : "";
 
     if (numeric) byNumeric.set(numeric, key);
