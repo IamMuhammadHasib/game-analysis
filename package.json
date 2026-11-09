@@ -1,0 +1,21 @@
+{
+  "name": "game-release-explorer",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "nuxt dev --host 0.0.0.0",
+    "build": "nuxt build",
+    "preview": "nuxt preview --host 0.0.0.0",
+    "postinstall": "nuxt prepare"
+  },
+  "dependencies": {
+    "echarts": "^6.0.0",
+    "nuxt": "^4.0.0",
+    "papaparse": "^5.5.3"
+  },
+  "devDependencies": {
+    "@types/geojson": "^7946.0.16",
+    "@types/papaparse": "^5.3.16",
+    "typescript": "^5.9.3"
+  }
+}
