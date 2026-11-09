@@ -1,14 +1,13 @@
-import Papa from "papaparse";
 import type { Feature, FeatureCollection, Geometry } from "geojson";
 
-type CsvRecord = Record<string, string | undefined>;
+export interface GenreOption {
+  genreId: string;
+  genre: string;
+}
 
 export interface GameRow {
   countryId: string;
-  country: string;
   releaseYear: number;
-  genreId: string;
-  genre: string;
   gameFrequency: number;
 }
 
@@ -24,17 +23,36 @@ export type CountryFeature = Feature<Geometry, MapProperties>;
 export type CountryCollection = FeatureCollection<Geometry, MapProperties>;
 
 export interface DashboardData {
+  genres: GenreOption[];
   chartRows: GameRow[];
   mapRows: GameRow[];
+  years: number[];
   countryCollection: CountryCollection;
 }
 
-// Change these paths when testing another data source.
-const DATA_SOURCES = {
-  chart: "/data/games-without-country.csv",
-  map: "/data/games.csv",
-  boundaries: "/data/countries.geojson",
-};
+interface ApiGenreOption {
+  genre_id: string | number;
+  genre: string;
+}
+
+interface ApiChartRow {
+  release_year: number;
+  game_frequency: number;
+}
+
+interface ApiMapRow extends ApiChartRow {
+  country_id: string | number;
+}
+
+interface DashboardApiResponse {
+  genreOptions: ApiGenreOption[];
+  chartRows: ApiChartRow[];
+  mapRows: ApiMapRow[];
+  yearOptions: { release_year: number }[];
+}
+
+const API_URL = "/api/dashboard";
+const GEOJSON_URL = "/data/countries.geojson";
 
 const countryNameAliases: Record<string, string[]> = {
   "united states": ["united states of america", "usa", "us"],
@@ -55,8 +73,8 @@ const countryNameAliases: Record<string, string[]> = {
   "state of palestine": ["palestine"],
 };
 
-const normalizeName = (value: unknown): string =>
-  String(value ?? "")
+function normalizeName(value: unknown): string {
+  return String(value ?? "")
     .trim()
     .toLocaleLowerCase()
     .normalize("NFD")
@@ -64,62 +82,6 @@ const normalizeName = (value: unknown): string =>
     .replace(/&/g, "and")
     .replace(/[^a-z0-9]+/g, " ")
     .trim();
-
-async function fetchText(path: string): Promise<string> {
-  const response = await fetch(path);
-
-  if (!response.ok) {
-    throw new Error(`Could not load ${path}. Check that the file exists.`);
-  }
-
-  return response.text();
-}
-
-function parseCsv(csvText: string, requireCountry: boolean): GameRow[] {
-  const parsed = Papa.parse<CsvRecord>(csvText, {
-    header: true,
-    skipEmptyLines: "greedy",
-    transformHeader: (header) => header.trim().toLowerCase(),
-    transform: (value) => value.trim(),
-  });
-
-  const required = [
-    "release_year",
-    "genre_id",
-    "genre",
-    "game_frequency",
-    ...(requireCountry ? ["country_id", "country"] : []),
-  ];
-
-  const headers = (parsed.meta.fields ?? []).map((header) =>
-    header.trim().toLowerCase(),
-  );
-
-  const missing = required.filter((field) => !headers.includes(field));
-
-  if (missing.length) {
-    throw new Error(`CSV is missing required column(s): ${missing.join(", ")}`);
-  }
-
-  return parsed.data.flatMap((record) => {
-    const releaseYear = Number(record.release_year);
-    const gameFrequency = Number(record.game_frequency);
-
-    if (!Number.isFinite(releaseYear) || !Number.isFinite(gameFrequency)) {
-      return [];
-    }
-
-    return [
-      {
-        countryId: String(record.country_id ?? "").trim(),
-        country: String(record.country ?? "").trim(),
-        releaseYear,
-        genreId: String(record.genre_id ?? "").trim(),
-        genre: String(record.genre ?? "").trim(),
-        gameFrequency,
-      },
-    ];
-  });
 }
 
 function normalizeGeoJson(raw: CountryCollection): CountryCollection {
@@ -166,53 +128,67 @@ function normalizeGeoJson(raw: CountryCollection): CountryCollection {
   return { ...raw, features };
 }
 
-export async function loadDashboardData(): Promise<DashboardData> {
-  const [chartCsv, mapCsv, geoJson] = await Promise.all([
-    fetchText(DATA_SOURCES.chart),
-    fetchText(DATA_SOURCES.map),
-    fetch(DATA_SOURCES.boundaries).then(async (response) => {
-      if (!response.ok) {
-        throw new Error(
-          "World boundaries are missing. Check /data/countries.geojson.",
-        );
-      }
-      return (await response.json()) as CountryCollection;
-    }),
-  ]);
+export async function loadDashboardData(
+  selectedGenreIds: string[] = [],
+): Promise<DashboardData> {
+  const params = new URLSearchParams();
 
-  const chartRows = parseCsv(chartCsv, false);
-  const mapRows = parseCsv(mapCsv, true);
-  const countryCollection = normalizeGeoJson(geoJson);
-
-  if (!chartRows.length || !mapRows.length) {
-    throw new Error("The CSV files loaded, but contain no usable data rows.");
+  if (selectedGenreIds.length > 0) {
+    params.set("genres", selectedGenreIds.join(","));
   }
 
-  return { chartRows, mapRows, countryCollection };
-}
+  const apiUrl = params.size ? `${API_URL}?${params.toString()}` : API_URL;
 
-export function getGenres(rows: GameRow[]): string[] {
-  return [...new Set(rows.map((row) => row.genre).filter(Boolean))].sort(
-    (a, b) => a.localeCompare(b),
-  );
+  const [apiResponse, geoResponse] = await Promise.all([
+    fetch(apiUrl),
+    fetch(GEOJSON_URL),
+  ]);
+
+  if (!apiResponse.ok) {
+    throw new Error("Could not load dashboard data from SQLite.");
+  }
+
+  if (!geoResponse.ok) {
+    throw new Error("Could not load the world country boundaries.");
+  }
+
+  const apiData = (await apiResponse.json()) as DashboardApiResponse;
+  const geoJson = (await geoResponse.json()) as CountryCollection;
+
+  const genres: GenreOption[] = apiData.genreOptions.map((item) => ({
+    genreId: String(item.genre_id),
+    genre: String(item.genre),
+  }));
+
+  const chartRows: GameRow[] = apiData.chartRows.map((row) => ({
+    countryId: "",
+    releaseYear: Number(row.release_year),
+    gameFrequency: Number(row.game_frequency),
+  }));
+
+  const mapRows: GameRow[] = apiData.mapRows.map((row) => ({
+    countryId: String(row.country_id),
+    releaseYear: Number(row.release_year),
+    gameFrequency: Number(row.game_frequency),
+  }));
+
+  return {
+    genres,
+    chartRows,
+    mapRows,
+    countryCollection: normalizeGeoJson(geoJson),
+    years: apiData.yearOptions.map((row) => Number(row.release_year)),
+  };
 }
 
 export function getYears(rows: GameRow[]): number[] {
   return [...new Set(rows.map((row) => row.releaseYear))].sort((a, b) => a - b);
 }
 
-function filterByGenres(rows: GameRow[], selectedGenres: string[]): GameRow[] {
-  if (selectedGenres.length === 0) return rows;
-
-  const selected = new Set(selectedGenres);
-  return rows.filter((row) => selected.has(row.genre));
-}
-
-export function getChartData(rows: GameRow[], selectedGenres: string[]) {
-  const filtered = filterByGenres(rows, selectedGenres);
+export function getChartData(rows: GameRow[], allYears: number[]) {
   const totals = new Map<number, number>();
 
-  for (const row of filtered) {
+  for (const row of rows) {
     totals.set(
       row.releaseYear,
       (totals.get(row.releaseYear) ?? 0) + row.gameFrequency,
@@ -220,32 +196,34 @@ export function getChartData(rows: GameRow[], selectedGenres: string[]) {
   }
 
   return {
-    data: getYears(rows).map((year) => ({
+    data: allYears.map((year) => ({
       year,
       frequency: totals.get(year) ?? 0,
     })),
-    total: filtered.reduce((sum, row) => sum + row.gameFrequency, 0),
+    total: rows.reduce((sum, row) => sum + row.gameFrequency, 0),
   };
 }
 
 export function getMapData(
   rows: GameRow[],
   countryCollection: CountryCollection,
-  selectedGenres: string[],
   selectedYear: number,
 ) {
   const byIso3 = new Map<string, string>();
   const byIso2 = new Map<string, string>();
-  const byName = new Map<string, string>();
   const byNumeric = new Map<string, string>();
+  const byName = new Map<string, string>();
   const displayNames = new Map<string, string>();
 
   for (const feature of countryCollection.features) {
     const properties = feature.properties ?? {};
     const key = String(properties.name ?? "");
     const displayName = String(properties.displayName ?? key);
+
     const iso3 = String(properties["ISO3166-1-Alpha-3"] ?? "").toUpperCase();
+
     const iso2 = String(properties["ISO3166-1-Alpha-2"] ?? "").toUpperCase();
+
     const rawNumeric = String(properties.ISO_N3 ?? "").trim();
     const numeric = /^\d+$/.test(rawNumeric) ? String(Number(rawNumeric)) : "";
 
@@ -257,7 +235,7 @@ export function getMapData(
     displayNames.set(key, displayName);
   }
 
-  function resolveCountryKey(countryId: string, countryName: string) {
+  function resolveCountryKey(countryId: string): string | null {
     const id = countryId.trim().toUpperCase();
 
     if (/^\d+$/.test(id)) {
@@ -275,7 +253,7 @@ export function getMapData(
       if (match) return match;
     }
 
-    const normalized = normalizeName(countryName);
+    const normalized = normalizeName(id);
     const direct = byName.get(normalized);
     if (direct) return direct;
 
@@ -293,17 +271,16 @@ export function getMapData(
     return null;
   }
 
-  const filtered = filterByGenres(rows, selectedGenres);
   const totals = new Map<string, number>();
   const unmatched = new Set<string>();
 
-  for (const row of filtered) {
+  for (const row of rows) {
     if (row.releaseYear > selectedYear) continue;
 
-    const key = resolveCountryKey(row.countryId, row.country);
+    const key = resolveCountryKey(row.countryId);
 
     if (!key) {
-      unmatched.add(row.country || row.countryId || "Unknown country");
+      unmatched.add(row.countryId || "Unknown country");
       continue;
     }
 
@@ -313,12 +290,13 @@ export function getMapData(
   return {
     data: [...totals.entries()].map(([name, value]) => ({
       name,
-      value,
+      value: Math.sqrt(value),
+      actualValue: value,
       displayName: displayNames.get(name) ?? name,
     })),
     unmatched: [...unmatched].sort(),
     countriesWithData: totals.size,
-    total: filtered
+    total: rows
       .filter((row) => row.releaseYear <= selectedYear)
       .reduce((sum, row) => sum + row.gameFrequency, 0),
   };

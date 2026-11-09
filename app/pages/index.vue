@@ -1,232 +1,105 @@
 <script setup lang="ts">
-import Papa from "papaparse";
 import type { ECharts, EChartsOption } from "echarts";
-import type { Feature, FeatureCollection, Geometry } from "geojson";
+import {
+  loadDashboardData,
+  getChartData,
+  getMapData,
+  type GameRow,
+  type GenreOption,
+  type CountryCollection,
+} from "../utils/dashboardData";
 
-type CsvRecord = Record<string, string | undefined>;
-
-interface GameRow {
-  countryId: string;
-  country: string;
-  releaseYear: number;
-  genreId: string;
-  genre: string;
-  gameFrequency: number;
-}
-
-interface MapProperties extends Record<string, unknown> {
-  name?: string;
-  "ISO3166-1-Alpha-2"?: string;
-  "ISO3166-1-Alpha-3"?: string;
-  displayName?: string;
-}
-
-type CountryFeature = Feature<Geometry, MapProperties>;
-type CountryCollection = FeatureCollection<Geometry, MapProperties>;
+// --------------------------------------------------
+// Dashboard state
+// --------------------------------------------------
 
 const view = ref<"chart" | "map">("chart");
 const selectedGenres = ref<string[]>([]);
 const genreMenuOpen = ref(false);
-const rows = ref<GameRow[]>([]);
+
+const genres = ref<GenreOption[]>([]);
+const chartRows = ref<GameRow[]>([]);
+const mapRows = ref<GameRow[]>([]);
 const countryCollection = ref<CountryCollection | null>(null);
+
 const selectedYear = ref(2025);
+
 const loading = ref(true);
+const hasLoaded = ref(false);
 const dataError = ref("");
-const mapError = ref("");
 const mapWarning = ref("");
 
 const chartElement = ref<HTMLDivElement | null>(null);
 const mapElement = ref<HTMLDivElement | null>(null);
+
+// --------------------------------------------------
+// ECharts
+// --------------------------------------------------
+
 let echarts: typeof import("echarts") | null = null;
 let chartInstance: ECharts | null = null;
 let mapInstance: ECharts | null = null;
 let mapRegistered = false;
 
-const countryNameAliases: Record<string, string[]> = {
-  "united states": ["united states of america", "usa", "us"],
-  "united kingdom": ["uk", "great britain", "britain"],
-  "russian federation": ["russia"],
-  "republic of korea": ["south korea", "korea south"],
-  "democratic people's republic of korea": ["north korea", "korea north"],
-  "viet nam": ["vietnam"],
-  czechia: ["czech republic"],
-  "cote d ivoire": ["ivory coast"],
-  "iran islamic republic of": ["iran"],
-  "syrian arab republic": ["syria"],
-  "lao peoples democratic republic": ["laos"],
-  "united republic of tanzania": ["tanzania"],
-  "bolivia plurinational state of": ["bolivia"],
-  "venezuela bolivarian republic of": ["venezuela"],
-  taiwan: ["taiwan province of china"],
-  "state of palestine": ["palestine"],
-};
+let requestId = 0;
 
-const normalizeName = (value: unknown): string =>
-  String(value ?? "")
-    .trim()
-    .toLocaleLowerCase()
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .replace(/&/g, "and")
-    .replace(/[^a-z0-9]+/g, " ")
-    .trim();
+// --------------------------------------------------
+// Computed data
+// --------------------------------------------------
 
-const genres = computed(() =>
-  [...new Set(rows.value.map((row) => row.genre).filter(Boolean))].sort(
-    (a, b) => a.localeCompare(b),
-  ),
-);
-const years = computed(() =>
-  [...new Set(rows.value.map((row) => row.releaseYear))].sort((a, b) => a - b),
-);
+const years = ref<number[]>([]);
+
 const minYear = computed(() => years.value[0] ?? 0);
 const maxYear = computed(() => years.value.at(-1) ?? 0);
 
-const filteredRows = computed(() => {
-  if (selectedGenres.value.length === 0) return rows.value;
-  const selected = new Set(selectedGenres.value);
-  return rows.value.filter((row) => selected.has(row.genre));
-});
+const chartData = computed(() => getChartData(chartRows.value, years.value));
 
-const chartData = computed(() => {
-  const totals = new Map<number, number>();
-  for (const row of filteredRows.value) {
-    totals.set(
-      row.releaseYear,
-      (totals.get(row.releaseYear) ?? 0) + row.gameFrequency,
-    );
-  }
-  return years.value.map((year) => ({
-    year,
-    frequency: totals.get(year) ?? 0,
-  }));
-});
-
-const filteredTotal = computed(() =>
-  filteredRows.value.reduce((sum, row) => sum + row.gameFrequency, 0),
-);
-const cumulativeTotal = computed(() =>
-  filteredRows.value
-    .filter((row) => row.releaseYear <= selectedYear.value)
-    .reduce((sum, row) => sum + row.gameFrequency, 0),
-);
-
-const selectedGenreLabel = computed(() => {
-  if (selectedGenres.value.length === 0) return "All genres";
-  return selectedGenres.value.join(", ");
-});
-
-const countryIndexes = computed(() => {
-  const byIso3 = new Map<string, string>();
-  const byIso2 = new Map<string, string>();
-  const byName = new Map<string, string>();
-  const byNumeric = new Map<string, string>();
-  const displayNames = new Map<string, string>();
-
-  for (const feature of countryCollection.value?.features ?? []) {
-    const properties = feature.properties ?? {};
-    const displayName = String(
-      properties.displayName ?? properties.name ?? "Unknown",
-    );
-    const key = String(properties.name ?? normalizeName(displayName));
-    const iso3 = String(properties["ISO3166-1-Alpha-3"] ?? "").toUpperCase();
-    const iso2 = String(properties["ISO3166-1-Alpha-2"] ?? "").toUpperCase();
-    const rawNumeric = String(properties.ISO_N3 ?? "").trim();
-
-    const numeric = /^\d+$/.test(rawNumeric) ? String(Number(rawNumeric)) : "";
-
-    if (numeric) {
-      byNumeric.set(numeric, key);
-    }
-
-    if (iso3 && iso3 !== "-99") byIso3.set(iso3, key);
-    if (iso2 && iso2 !== "-99") byIso2.set(iso2, key);
-    byName.set(normalizeName(displayName), key);
-    displayNames.set(key, displayName);
-  }
-
-  return { byIso3, byIso2, byNumeric, byName, displayNames };
-});
-
-function resolveCountryKey(
-  countryId: string,
-  countryName: string,
-): string | null {
-  const id = countryId.trim().toUpperCase();
-  if (/^\d+$/.test(id)) {
-    const numericMatch = countryIndexes.value.byNumeric.get(String(Number(id)));
-    if (numericMatch) return numericMatch;
-  }
-  if (/^[A-Z]{3}$/.test(id)) {
-    const byIso3 = countryIndexes.value.byIso3.get(id);
-    if (byIso3) return byIso3;
-  }
-  if (/^[A-Z]{2}$/.test(id)) {
-    const byIso2 = countryIndexes.value.byIso2.get(id);
-    if (byIso2) return byIso2;
-  }
-
-  const normalized = normalizeName(countryName);
-  const direct = countryIndexes.value.byName.get(normalized);
-  if (direct) return direct;
-
-  // Try common alternate country names in both directions.
-  const candidates = new Set<string>();
-  for (const [canonical, aliases] of Object.entries(countryNameAliases)) {
-    const normalizedCanonical = normalizeName(canonical);
-    const normalizedAliases = aliases.map(normalizeName);
-    if (
-      normalized === normalizedCanonical ||
-      normalizedAliases.includes(normalized)
-    ) {
-      candidates.add(normalizedCanonical);
-      for (const alias of normalizedAliases) candidates.add(alias);
-    }
-  }
-  for (const candidate of candidates) {
-    const match = countryIndexes.value.byName.get(candidate);
-    if (match) return match;
-  }
-  return null;
-}
+const genreDropdown = ref<HTMLDetailsElement | null>(null);
 
 const mapData = computed(() => {
-  const totals = new Map<string, number>();
-  const unmatched = new Set<string>();
-
-  for (const row of filteredRows.value) {
-    if (row.releaseYear > selectedYear.value) continue;
-    const key = resolveCountryKey(row.countryId, row.country);
-    if (!key) {
-      unmatched.add(row.country || row.countryId || "Unknown country");
-      continue;
-    }
-    totals.set(key, (totals.get(key) ?? 0) + row.gameFrequency);
+  if (!countryCollection.value) {
+    return {
+      data: [],
+      unmatched: [],
+      countriesWithData: 0,
+      total: 0,
+    };
   }
 
-  return {
-    data: [...totals.entries()].map(([name, value]) => ({
-      name,
-      value,
-      displayName: countryIndexes.value.displayNames.get(name) ?? name,
-    })),
-    unmatched: [...unmatched].sort(),
-    countriesWithData: totals.size,
-  };
+  return getMapData(mapRows.value, countryCollection.value, selectedYear.value);
+});
+
+const filteredTotal = computed(() => chartData.value.total);
+const cumulativeTotal = computed(() => mapData.value.total);
+
+const selectedGenreLabel = computed(() => {
+  if (selectedGenres.value.length === 0) {
+    return "All genres";
+  }
+
+  return genres.value
+    .filter((genre) => selectedGenres.value.includes(genre.genreId))
+    .map((genre) => genre.genre)
+    .join(", ");
 });
 
 const numberFormat = new Intl.NumberFormat("en-US", {
   maximumFractionDigits: 1,
 });
-const formatNumber = (value: number) => numberFormat.format(value);
 
-function toggleGenre(genre: string) {
-  const selected = [...selectedGenres.value];
-  if (selected.includes(genre)) {
-    selectedGenres.value = selected.filter((item) => item !== genre);
-  } else if (selected.length < 2) {
-    selected.push(genre);
-    selectedGenres.value = selected;
+function formatNumber(value: number): string {
+  return numberFormat.format(value);
+}
+
+// --------------------------------------------------
+// Genre selection
+// --------------------------------------------------
+
+function toggleGenre(genreId: string) {
+  if (selectedGenres.value.includes(genreId)) {
+    selectedGenres.value = selectedGenres.value.filter((id) => id !== genreId);
+  } else {
+    selectedGenres.value = [...selectedGenres.value, genreId];
   }
 }
 
@@ -234,227 +107,285 @@ function chooseAllGenres() {
   selectedGenres.value = [];
 }
 
-function parseGameCsv(csvText: string): GameRow[] {
-  const parsed = Papa.parse<CsvRecord>(csvText, {
-    header: true,
-    skipEmptyLines: "greedy",
-    transformHeader: (header) => header.trim().toLowerCase(),
-    transform: (value) => value.trim(),
-  });
+function handleOutsideClick(event: MouseEvent) {
+  const target = event.target as Node | null;
 
-  const required = [
-    "country_id",
-    "country",
-    "release_year",
-    "genre_id",
-    "genre",
-    "game_frequency",
-  ];
-  const headers = (parsed.meta.fields ?? []).map((header) =>
-    header.trim().toLowerCase(),
-  );
-  const missing = required.filter((field) => !headers.includes(field));
-  if (missing.length) {
-    throw new Error(`CSV is missing required column(s): ${missing.join(", ")}`);
+  if (target && !genreDropdown.value?.contains(target)) {
+    genreMenuOpen.value = false;
   }
-
-  return parsed.data.flatMap((record) => {
-    const releaseYear = Number(record.release_year);
-    const gameFrequency = Number(record.game_frequency);
-    if (!Number.isFinite(releaseYear) || !Number.isFinite(gameFrequency))
-      return [];
-
-    return [
-      {
-        countryId: String(record.country_id ?? "").trim(),
-        country: String(record.country ?? "").trim(),
-        releaseYear,
-        genreId: String(record.genre_id ?? "").trim(),
-        genre: String(record.genre ?? "").trim(),
-        gameFrequency,
-      },
-    ];
-  });
 }
+
+// --------------------------------------------------
+// Load data
+// --------------------------------------------------
 
 async function loadData() {
-  loading.value = true;
-  dataError.value = "";
-  mapError.value = "";
-  try {
-    const csvResponse = await fetch("/data/games.csv");
-    if (!csvResponse.ok)
-      throw new Error(
-        "Could not load /data/games.csv. Check that the file exists in public/data/.",
-      );
-    rows.value = parseGameCsv(await csvResponse.text());
-    if (!rows.value.length)
-      throw new Error("The CSV loaded, but it contains no usable data rows.");
-    selectedYear.value = maxYear.value;
-  } catch (error) {
-    dataError.value =
-      error instanceof Error ? error.message : "Could not load the CSV data.";
+  const currentRequest = ++requestId;
+  const isInitialLoad = !hasLoaded.value;
+
+  if (isInitialLoad) {
+    loading.value = true;
   }
 
-  try {
-    const mapResponse = await fetch("/data/countries.geojson");
-    if (!mapResponse.ok)
-      throw new Error(
-        "World boundaries are missing. Run the map-data download script in the project README.",
-      );
-    const rawGeoJson = (await mapResponse.json()) as CountryCollection;
-    const features = rawGeoJson.features
-      .filter((feature) => feature.geometry !== null)
-      .map((feature: CountryFeature) => {
-        const properties = feature.properties ?? {};
-        const displayName = String(
-          properties.name ??
-            properties.NAME_EN ??
-            properties.ADMIN ??
-            properties.NAME ??
-            "Unknown",
-        );
-        const iso3 =
-          [
-            properties["ISO3166-1-Alpha-3"],
-            properties.ISO_A3_EH,
-            properties.ISO_A3,
-            properties.ADM0_A3,
-          ]
-            .map((value) => String(value ?? "").toUpperCase())
-            .find((value) => value && value !== "-99") ?? "";
-        const iso2 =
-          [properties["ISO3166-1-Alpha-2"], properties.ISO_A2]
-            .map((value) => String(value ?? "").toUpperCase())
-            .find((value) => value && value !== "-99") ?? "";
-        const key = iso3 || normalizeName(displayName);
-        return {
-          ...feature,
-          properties: {
-            ...properties,
-            "ISO3166-1-Alpha-3": iso3,
-            "ISO3166-1-Alpha-2": iso2,
-            name: key,
-            displayName,
-          },
-        };
-      }) as CountryFeature[];
+  dataError.value = "";
 
-    countryCollection.value = { ...rawGeoJson, features };
-    echarts?.registerMap("game-world", { geoJSON: countryCollection.value });
-    mapRegistered = true;
-  } catch (error) {
-    mapError.value =
-      error instanceof Error
-        ? error.message
-        : "Could not load world map boundaries.";
-  } finally {
+  try {
+    // An empty array means All genres.
+    const result = await loadDashboardData([...selectedGenres.value]);
+
+    // Ignore outdated responses if another filter request started.
+    if (currentRequest !== requestId) return;
+
+    genres.value = result.genres ?? [];
+    chartRows.value = result.chartRows ?? [];
+    mapRows.value = result.mapRows ?? [];
+    countryCollection.value = result.countryCollection;
+    years.value = (result.years ?? [])
+      .map(Number)
+      .filter(Number.isFinite)
+      .sort((a, b) => a - b);
+
+    // Keep the selected year within the available range.
+    if (years.value.length > 0) {
+      selectedYear.value = Math.min(
+        Math.max(selectedYear.value, minYear.value),
+        maxYear.value,
+      );
+    } else {
+      selectedYear.value = 0;
+    }
+
+    // Register the map once the GeoJSON is available.
+    if (echarts && countryCollection.value && !mapRegistered) {
+      echarts.registerMap("game-world", {
+        geoJSON: countryCollection.value,
+      });
+
+      mapRegistered = true;
+    }
+
+    // IMPORTANT:
+    // Reveal the chart/map elements before trying to initialize ECharts.
+    hasLoaded.value = true;
     loading.value = false;
+
+    // Wait for Vue to render the chart/map DOM elements.
     await nextTick();
+
+    if (currentRequest !== requestId) return;
+
     initialiseCharts();
     refreshCharts();
+    resizeCharts();
+  } catch (error) {
+    if (currentRequest !== requestId) return;
+
+    const message =
+      error instanceof Error ? error.message : "Could not load dashboard data.";
+
+    if (!hasLoaded.value) {
+      // Show the full error panel only if the initial load failed.
+      dataError.value = message;
+    } else {
+      // On a filter refresh, keep the existing chart visible.
+      console.error("Could not refresh dashboard data:", error);
+    }
+  } finally {
+    if (currentRequest === requestId) {
+      loading.value = false;
+      hasLoaded.value = true;
+    }
   }
 }
 
+// --------------------------------------------------
+// Chart configuration
+// --------------------------------------------------
+
 function buildChartOption(): EChartsOption {
-  const data = chartData.value;
+  const data = chartData.value.data;
+
   return {
     animationDuration: 450,
-    grid: { left: 58, right: 24, top: 34, bottom: 48 },
+
+    grid: {
+      left: 58,
+      right: 24,
+      top: 34,
+      bottom: 48,
+    },
+
     tooltip: {
       trigger: "axis",
       backgroundColor: "#14283f",
       borderWidth: 0,
       textStyle: { color: "#fff" },
+
       axisPointer: {
         type: "line",
-        lineStyle: { color: "#9bb2c7", type: "dashed" },
+        lineStyle: {
+          color: "#9bb2c7",
+          type: "dashed",
+        },
       },
+
       formatter: (params: unknown) => {
         const items = Array.isArray(params)
-          ? (params as Array<{ axisValue?: string; data?: number }>)
+          ? (params as Array<{
+              axisValue?: string;
+              data?: number | null;
+            }>)
           : [];
+
         const first = items[0];
+
         return `<strong>${first?.axisValue ?? ""}</strong><br/>Game frequency: ${formatNumber(Number(first?.data ?? 0))}`;
       },
     },
+
     xAxis: {
       type: "category",
       data: data.map((item) => String(item.year)),
       boundaryGap: true,
-      axisTick: { alignWithLabel: true },
-      axisLine: { lineStyle: { color: "#dbe3eb" } },
-      axisLabel: { color: "#718096", hideOverlap: true },
+
+      axisTick: {
+        alignWithLabel: true,
+      },
+
+      axisLine: {
+        lineStyle: { color: "#dbe3eb" },
+      },
+
+      axisLabel: {
+        color: "#718096",
+        hideOverlap: true,
+      },
     },
+
     yAxis: {
       type: "value",
       name: "Game frequency",
-      nameTextStyle: { color: "#718096", padding: [0, 0, 10, 0] },
-      splitLine: { lineStyle: { color: "#edf1f5", type: "dashed" } },
-      axisLabel: { color: "#718096" },
+
+      nameTextStyle: {
+        color: "#718096",
+        padding: [0, 0, 10, 0],
+      },
+
+      min: 0,
+
+      splitLine: {
+        lineStyle: {
+          color: "#edf1f5",
+          type: "dashed",
+        },
+      },
+
+      axisLabel: {
+        color: "#718096",
+      },
     },
+
     series: [
       {
         name: "Annual frequency",
         type: "bar",
         barMaxWidth: 28,
+
         data: data.map((item) => item.frequency),
-        itemStyle: { color: "#4b9b9a", borderRadius: [5, 5, 0, 0] },
-        emphasis: { itemStyle: { color: "#277b81" } },
+
+        itemStyle: {
+          color: "#4b9b9a",
+          borderRadius: [5, 5, 0, 0],
+        },
+
+        emphasis: {
+          itemStyle: {
+            color: "#277b81",
+          },
+        },
       },
+
       {
         name: "Trend",
         type: "line",
+
         data: data.map((item) => item.frequency),
+
         smooth: 0.25,
         symbol: "circle",
         symbolSize: 7,
-        lineStyle: { color: "#244f78", width: 2.5 },
-        itemStyle: { color: "#244f78", borderColor: "#fff", borderWidth: 2 },
-        tooltip: { show: false },
+
+        lineStyle: {
+          color: "#244f78",
+          width: 2.5,
+        },
+
+        itemStyle: {
+          color: "#244f78",
+          borderColor: "#fff",
+          borderWidth: 2,
+        },
+
+        tooltip: {
+          show: false,
+        },
+
         z: 3,
       },
     ],
   };
 }
 
+// --------------------------------------------------
+// Map configuration
+// --------------------------------------------------
+
 function buildMapOption(): EChartsOption {
   const values = mapData.value.data.map((item) => item.value);
   const maxValue = Math.max(1, ...values);
+
   return {
     animationDuration: 400,
+
     tooltip: {
       trigger: "item",
       backgroundColor: "#14283f",
       borderWidth: 0,
       textStyle: { color: "#fff" },
+
       formatter: (params: unknown) => {
         const item = params as {
           name?: string;
-          value?: number;
-          data?: { displayName?: string; value?: number };
+          value?: number | null;
+          data?: {
+            displayName?: string;
+            value?: number | null;
+            actualValue?: number | null;
+          };
         };
-        const name = item.data?.displayName ?? item.name ?? "Country";
-        const value = Number(item.data?.value ?? item.value ?? 0);
+
+        const name = item?.data?.displayName ?? item?.name ?? "Country";
+
+        const value = Number(item?.data?.actualValue ?? 0);
+
         return `<strong>${name}</strong><br/>Cumulative frequency: ${formatNumber(value)}`;
       },
     },
+
     visualMap: {
       type: "continuous",
       min: 0,
       max: maxValue,
-
       show: false,
-
       orient: "horizontal",
       left: "center",
       bottom: 14,
-
       calculable: false,
       realtime: true,
 
       text: ["Higher", "Lower"],
       textGap: 10,
+
       textStyle: {
         color: "#66768a",
         fontSize: 11,
@@ -467,6 +398,7 @@ function buildMapOption(): EChartsOption {
         color: ["#edf4e8", "#b8d8b1", "#79bca7", "#3989a8", "#164d7c"],
       },
     },
+
     series: [
       {
         name: "Cumulative game frequency",
@@ -475,38 +407,52 @@ function buildMapOption(): EChartsOption {
         roam: true,
         selectedMode: false,
         zoom: 1,
+
         layoutCenter: ["50%", "52%"],
         layoutSize: "165%",
+
         itemStyle: {
           areaColor: "#f0f3f5",
           borderColor: "#fff",
           borderWidth: 0.55,
         },
+
         emphasis: {
-          label: { show: false },
+          label: {
+            show: false,
+          },
+
           itemStyle: {
             areaColor: "#f2bd63",
             borderColor: "#fff",
             borderWidth: 1,
           },
         },
+
         data: mapData.value.data,
       },
     ],
   };
 }
 
+// --------------------------------------------------
+// Chart lifecycle
+// --------------------------------------------------
+
 function initialiseCharts() {
   if (!import.meta.client || !echarts) return;
 
-  if (view.value === "chart") {
-    if (chartElement.value && !chartInstance) {
-      chartInstance = echarts.init(chartElement.value);
-    }
-  } else {
-    if (mapElement.value && !mapInstance && mapRegistered) {
-      mapInstance = echarts.init(mapElement.value);
-    }
+  if (view.value === "chart" && chartElement.value && !chartInstance) {
+    chartInstance = echarts.init(chartElement.value);
+  }
+
+  if (
+    view.value === "map" &&
+    mapElement.value &&
+    !mapInstance &&
+    mapRegistered
+  ) {
+    mapInstance = echarts.init(mapElement.value);
   }
 }
 
@@ -514,19 +460,26 @@ function refreshCharts() {
   if (!echarts) return;
 
   if (view.value === "chart") {
-    if (chartInstance) {
-      chartInstance.setOption(buildChartOption(), true);
+    if (chartElement.value) {
+      initialiseCharts();
+
+      chartInstance?.setOption(buildChartOption(), true);
     }
+
     return;
   }
 
-  if (view.value === "map" && mapRegistered && mapInstance) {
-    mapInstance.setOption(buildMapOption(), true);
+  if (view.value === "map" && mapRegistered) {
+    if (mapElement.value) {
+      initialiseCharts();
+
+      mapInstance?.setOption(buildMapOption(), true);
+    }
   }
 
-  mapWarning.value = mapData.value.unmatched.length
-    ? `${mapData.value.unmatched.length} country name(s) could not be matched to map boundaries.`
-    : "";
+  // mapWarning.value = mapData.value.unmatched.length
+  //   ? `${mapData.value.unmatched.length} country ID(s) could not be matched to map boundaries.`
+  //   : "";
 }
 
 function resizeCharts() {
@@ -537,35 +490,72 @@ function resizeCharts() {
   }
 }
 
-watch(
-  [selectedGenres, selectedYear, chartData, mapData, view],
-  async () => {
-    await nextTick();
+async function changeView(nextView: "chart" | "map") {
+  view.value = nextView;
 
-    initialiseCharts();
-    refreshCharts();
+  await nextTick();
 
-    // Wait for the visible container to have its final dimensions.
-    await nextTick();
+  initialiseCharts();
+  refreshCharts();
+  resizeCharts();
+}
 
-    resizeCharts();
-  },
-  { deep: true, flush: "post" },
-);
+// --------------------------------------------------
+// Watchers
+// --------------------------------------------------
+
+watch(selectedGenres, () => {
+  loadData();
+});
+
+watch(selectedYear, async () => {
+  if (view.value !== "map") return;
+
+  await nextTick();
+
+  refreshCharts();
+  resizeCharts();
+});
+
+watch(view, async () => {
+  await nextTick();
+
+  initialiseCharts();
+  refreshCharts();
+  resizeCharts();
+});
+
+// --------------------------------------------------
+// Mount / unmount
+// --------------------------------------------------
 
 onMounted(async () => {
-  const echartsModule = await import("echarts");
-  echarts = echartsModule;
+  echarts = await import("echarts");
+
   await loadData();
+
   window.addEventListener("resize", resizeCharts);
 });
 
 onBeforeUnmount(() => {
+  // Invalidate pending requests.
+  requestId++;
+
   window.removeEventListener("resize", resizeCharts);
+
   chartInstance?.dispose();
   mapInstance?.dispose();
+
   chartInstance = null;
   mapInstance = null;
+});
+
+onMounted(() => {
+  document.addEventListener("click", handleOutsideClick);
+});
+
+onBeforeUnmount(() => {
+  document.removeEventListener("click", handleOutsideClick);
 });
 </script>
 
@@ -576,6 +566,7 @@ onBeforeUnmount(() => {
         <div class="genre-control">
           <!-- <label class="control-label">GENRE</label> -->
           <details
+            ref="genreDropdown"
             class="genre-dropdown"
             :open="genreMenuOpen"
             @toggle="genreMenuOpen = ($event.target as HTMLDetailsElement).open"
@@ -601,26 +592,21 @@ onBeforeUnmount(() => {
               <div class="genre-divider"></div>
               <label
                 v-for="genre in genres"
-                :key="genre"
+                :key="genre.genreId"
                 class="genre-option"
-                :class="{
-                  disabled:
-                    selectedGenres.length >= 2 &&
-                    !selectedGenres.includes(genre),
-                }"
               >
                 <input
                   type="checkbox"
-                  :checked="selectedGenres.includes(genre)"
-                  :disabled="
-                    selectedGenres.length >= 2 &&
-                    !selectedGenres.includes(genre)
-                  "
-                  @change="toggleGenre(genre)"
+                  :checked="selectedGenres.includes(genre.genreId)"
+                  @change="toggleGenre(genre.genreId)"
                 />
-                <span>{{ genre }}</span>
+                <span>{{ genre.genre }}</span>
               </label>
-              <p class="genre-help">Choose up to two genres, or select all.</p>
+
+              <p class="genre-help">
+                Select any number of genres. All selected genres must match the
+                same game.
+              </p>
             </div>
           </details>
         </div>
@@ -699,11 +685,9 @@ onBeforeUnmount(() => {
       </div>
 
       <div v-else-if="dataError" class="error-panel">
-        <strong>We couldn't load your CSV.</strong>
         <span>{{ dataError }}</span>
         <span class="error-hint"
-          >Expected columns: country_id, country, release_year, genre_id, genre,
-          game_frequency.</span
+          >Check the SQLite database and world boundaries data.</span
         >
       </div>
 
@@ -738,13 +722,7 @@ onBeforeUnmount(() => {
         </div>
 
         <div v-show="view === 'map'" class="visual-section map-section">
-          <div v-if="mapError" class="map-missing-panel">
-            <strong>World map data is not installed yet.</strong>
-            <span>{{ mapError }}</span>
-            <code>./scripts/download-map.sh</code>
-          </div>
-
-          <div v-else class="map-stage">
+          <div class="map-stage">
             <!-- World map -->
             <div
               ref="mapElement"
@@ -761,6 +739,10 @@ onBeforeUnmount(() => {
                 {{ minYear }} through {{ selectedYear }} ·
                 {{ selectedGenreLabel }}
               </p>
+            </div>
+
+            <div v-if="mapWarning" class="map-warning">
+              {{ mapWarning }}
             </div>
 
             <!-- Floating cumulative summary -->
