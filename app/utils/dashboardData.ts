@@ -147,7 +147,9 @@ export async function loadDashboardData(
   ]);
 
   if (!apiResponse.ok) {
-    throw new Error("Could not load dashboard data from SQLite.");
+    const details = await apiResponse.text();
+
+    throw new Error(`SQLite API error (${apiResponse.status}): ${details}`);
   }
 
   if (!geoResponse.ok) {

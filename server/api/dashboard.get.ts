@@ -1,5 +1,6 @@
 import initSqlJs from "sql.js";
 import path from "node:path";
+import { createError } from "nuxt/internal/server-default";
 
 let dbPromise: Promise<import("sql.js").Database> | null = null;
 
@@ -12,16 +13,27 @@ async function getDatabase() {
       });
 
       const storage = useStorage("assets:server");
+
       const file = await storage.getItemRaw<Uint8Array>(
         "game_research_light.db",
       );
 
       if (!file) {
-        throw new Error("SQLite database file was not found.");
+        console.error("SQLite database missing from Nitro server assets.");
+
+        throw createError({
+          statusCode: 500,
+          statusMessage: "SQLite database file was not found in server assets.",
+        });
       }
 
+      console.log("SQLite database loaded. Bytes:", file.length);
+
       return new SQL.Database(new Uint8Array(file));
-    })();
+    })().catch((error) => {
+      dbPromise = null;
+      throw error;
+    });
   }
 
   return dbPromise;
